@@ -325,9 +325,6 @@ class CattleData(BaseModel):
     lactation_stage: str
     reproductive_status: str
 
-# Create FastAPI app
-app = FastAPI()
-
 @app.post("/predict-growth-weight")
 async def predict_weight(data: CattleData):
     
