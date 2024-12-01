@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+pillow
+tensorflow
+matplotlib
+numpy
+google_cloud_firestore
+firebase-admin
+uuid
+pandas
+bcrypt
+joblib
+scikit-learn
