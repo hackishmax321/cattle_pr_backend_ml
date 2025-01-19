@@ -21,6 +21,10 @@ from firebase_admin import credentials, db as FireDB
 import traceback
 from math import radians, sin, cos, sqrt, atan2
 
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import MultinomialNB
+
 app = FastAPI()
 origins = [
     "http://localhost:3000",
@@ -42,6 +46,9 @@ MODEL_HEALTH = joblib.load('cow_health_model.joblib')
 
 # Growth Model
 MODEL_GROWTH = joblib.load('model_growth_in_weight.joblib')
+
+# Feeding Patter
+MODEL_FEED = joblib.load('feeding_pattern_model.joblib')
 
 # Load Breed detection Model
 MODEL_BREED = load_model("model_breed_detect.h5")
@@ -204,12 +211,147 @@ def predict_health_status(request: HealthStatusRequest):
         health_status_encoded = MODEL_HEALTH.predict(input_features)[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model prediction error: {e}")
-
-    # Convert the encoded health status back to the readable format
     health_status = health_status_mapping.get(health_status_encoded, "Unknown")
 
     return {"health_status": health_status}
 
+class FeedPredictionRequest(BaseModel):
+    cattle_breed: str
+    health_status: str
+    status: str
+    feeding_amount_KG_morning: float
+    score_morning: float
+    feeding_amount_KG_noon: float
+    score_noon: float
+    feeding_amount_KG_evening: float
+    score_evening: float
+    travel_distance_per_day_KM: float
+
+encodings = {
+    'cattle_breed': {'Australian Milking Zebu': 0, 'Ayrshire': 1, 'Friesian': 2, 'Jersey': 3, 'Lanka White': 4, 'Sahiwal': 5},
+    'health_status': {'Healthy': 0, 'Sick': 1},
+    'status': {'Breeding': 0, 'Bulls': 1, 'Calves ': 2, 'Heifers ': 3, 'Lactating': 4, 'Pregnant': 5},
+    'food_type_morning': {'Coconut Poonac': 0, 'Coconut Poonac, Grass': 1, 'Milk': 2},
+    'food_type_noon': {'Coconut Poonac, Grass': 0, 'Grass, Paddy Straw': 1, 'Napier Grass, Guinea grass': 2,
+                       'Napier Grass, Guinea grass, Para grass': 3, 'Napier Grass, Guinea grass,Gliricidia': 4,
+                       'Paddy Straw, Grass (Chopped)': 5, 'Para grass, Gliricidia': 6},
+    'food_type_evening': {'Milk': 0, 'Paddy Straw': 1, 'Paddy Straw, Corn': 2, 'Paddy Straw, Grass': 3, 'Paddy Straw, Legumes': 4}
+}
+
+@app.post("/predict_food_type")
+async def predict_food_type(request: FeedPredictionRequest):
+    encoded_input = [
+        encodings['cattle_breed'].get(request.cattle_breed, -1),
+        encodings['health_status'].get(request.health_status, -1),
+        encodings['status'].get(request.status, -1),
+        request.feeding_amount_KG_morning,
+        request.score_morning,
+        request.feeding_amount_KG_noon,
+        request.score_noon,
+        request.feeding_amount_KG_evening,
+        request.score_evening,
+        request.travel_distance_per_day_KM
+    ]
+
+    if -1 in encoded_input[:3]:  
+        raise HTTPException(status_code=400, detail="Invalid input value(s)")
+
+    encoded_input = np.array(encoded_input).reshape(1, -1)
+
+    try:
+        prediction = MODEL_FEED.predict(encoded_input)
+        morning_pred, noon_pred, evening_pred = prediction[0].split('-')
+        food_type_morning = [key for key, value in encodings['food_type_morning'].items() if value == int(morning_pred)][0]
+        food_type_noon = [key for key, value in encodings['food_type_noon'].items() if value == int(noon_pred)][0]
+        food_type_evening = [key for key, value in encodings['food_type_evening'].items() if value == int(evening_pred)][0]
+
+        return {
+            'morning': food_type_morning,
+            'noon': food_type_noon,
+            'evening': food_type_evening
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+
+# Feed patern save
+class CattleData(BaseModel):
+    cattle_name: str
+    health_status: str
+    status: str
+    food_type_morning: str
+    feeding_amount_KG_morning: float
+    score_morning: int
+    food_type_noon: str
+    feeding_amount_KG_noon: float
+    score_noon: int
+    food_type_evening: str
+    feeding_amount_KG_evening: float
+    score_evening: int
+    feed_platform: str
+    # feeding_amount_KG_L: float
+    travel_distance_per_day_KM: float
+    farmers_id: str
+    farmer_name: str
+
+# Endpoint to save cattle data
+@app.post("/feed-patterns")
+async def save_cattle_data(cattle_data: CattleData):
+    try:
+        # Add the cattle data to Firestore
+        feed_patterns_collection = db.collection("feed_patterns")
+        new_doc = feed_patterns_collection.document()
+        new_doc.set(cattle_data.dict())
+
+        return {"message": "Cattle data successfully saved", "id": new_doc.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving cattle data: {str(e)}")
+
+# Endpoint to retrieve all cattle data
+@app.get("/feed-patterns")
+async def get_all_cattle_data():
+    try:
+        feed_patterns_collection = db.collection("feed_patterns")
+        docs = feed_patterns_collection.stream()
+
+        cattle_data_list = [doc.to_dict() for doc in docs]
+
+        return {"data": cattle_data_list}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching cattle data: {str(e)}")
+
+# Endpoint to retrieve cattle data by ID
+@app.get("/feed-patterns/{cattle_id}")
+async def get_cattle_data_by_id(cattle_id: str):
+    try:
+        feed_patterns_collection = db.collection("feed_patterns")
+        doc = feed_patterns_collection.document(cattle_id).get()
+
+        if not doc.exists:
+            raise HTTPException(status_code=404, detail="Cattle data not found")
+
+        return {"data": doc.to_dict()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching cattle data by ID: {str(e)}")
+
+# Endpoint to retrieve cattle data by farmer
+@app.get("/feed-patterns/farmer/{farmer_id}")
+async def get_cattle_data_by_farmer(farmer_id: str):
+    try:
+        feed_patterns_collection = db.collection("feed_patterns")
+        docs = feed_patterns_collection.where("farmers_id", "==", farmer_id).stream()
+
+        cattle_data_list = [doc.to_dict() for doc in docs]
+
+        if not cattle_data_list:
+            raise HTTPException(status_code=404, detail="No cattle data found for the given farmer")
+
+        return {"data": cattle_data_list}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching cattle data by farmer: {str(e)}")
+
+
+# Breed Related
 
 class Breed(BaseModel):
     image: str
@@ -290,6 +432,88 @@ async def predict_pest(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
 
+# Breed Information
+file_path = 'breed_dataset/cattle_breed_idintification_dataset.xlsx'
+df = pd.read_excel(file_path)
+
+# Combine text-heavy fields into a single feature
+df['text_data'] = (
+    df['Cattle Breed Name'] + " " +
+    df['Pedigree/Lineage'] + " " +
+    df['Optimal Rearing Conditions'] + " " +
+    df['Physical Characteristics'] + " " +
+    df['Temperament'] + " " +
+    df['Productivity Metrics']
+)
+
+# # Target variable
+# target = 'Origin'
+
+# # Train-test split
+# X_train, X_test, y_train, y_test = train_test_split(
+#     df['text_data'],
+#     df[target],
+#     test_size=0.2,
+#     random_state=42
+# )
+
+# # Vectorize text data
+# tfidf = TfidfVectorizer(stop_words='english', max_features=5000)
+# X_train_tfidf = tfidf.fit_transform(X_train)
+# X_test_tfidf = tfidf.transform(X_test)
+
+# # Train a Naive Bayes classifier
+# model = MultinomialNB()
+# model.fit(X_train_tfidf, y_train)
+
+# Save the model and vectorizer
+model = joblib.load('cattle_breed_nlp_model.joblib')
+tfidf = joblib.load('tfidf_vectorizer.joblib')
+
+# Define request model
+class InsightRequest(BaseModel):
+    breed_name: str
+    adopted: bool
+
+# Define output model for FastAPI
+class InsightResponse(BaseModel):
+    Breed: str
+    Adopted: str
+    Predicted_Origin: str
+    Rearing_Conditions: str
+    Temperament: str
+    Milk_Production: int
+    Lifespan: int
+
+@app.post("/insights", response_model=InsightResponse)
+def provide_insights(request: InsightRequest):
+    breed_name = request.breed_name
+    adopted = request.adopted
+
+    # Filter dataset for the given breed
+    breed_data = df[df['Cattle Breed Name'].str.contains(breed_name, case=False, na=False)]
+
+    if breed_data.empty:
+        return {"error": "Breed not found in the dataset."}
+
+    # Generate prediction using the model (use text_data column)
+    breed_text = breed_data['text_data'].iloc[0]
+    breed_tfidf = tfidf.transform([breed_text])
+    predicted_origin = model.predict(breed_tfidf)[0]
+
+    # Convert numpy types to native Python types
+    insights = InsightResponse(
+        Breed=breed_name,
+        Adopted="Yes" if adopted else "No",
+        Predicted_Origin=predicted_origin,
+        Rearing_Conditions=breed_data['Optimal Rearing Conditions'].iloc[0],
+        Temperament=breed_data['Temperament'].iloc[0],
+        Milk_Production=int(breed_data['Milk Production Ability (Liters/Year)'].iloc[0]),
+        Lifespan=int(breed_data['Lifespan (Years)'].iloc[0])
+    )
+    return insights
+
+
 # Growth Monitor
 CATTLE_BREED_ENCODING = {
     ' ': 0,
@@ -324,6 +548,7 @@ class CattleData(BaseModel):
     feed_kg_per_day: float
     lactation_stage: str
     reproductive_status: str
+
 
 @app.post("/predict-growth-weight")
 async def predict_weight(data: CattleData):
@@ -411,3 +636,30 @@ async def get_location():
         return {"location": location_data, "location_24": location24_data, "duration": duration}
     except Exception as e:
         return HTTPException(status_code=500, detail=f"Error fetching location data: {str(e)}")
+
+# Farm Location / border save
+class FarmBorderRequest(BaseModel):
+    user: str
+    farm_name: str
+    details: str
+    border: list[dict]
+
+@app.post("/mark-farm-border")
+async def mark_farm_border(request: FarmBorderRequest):
+    try:
+        # Prepare farm data
+        farm_data = {
+            "user": request.user,
+            "farm_name": request.farm_name,
+            "details": request.details,
+            "border": request.border,
+        }
+        
+        # Save to Firestore
+        farms_collection = db.collection("farms")
+        new_farm_doc = farms_collection.document()
+        new_farm_doc.set(farm_data)
+        
+        return {"message": "Farm border successfully saved", "farm_id": new_farm_doc.id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving farm border: {str(e)}")
