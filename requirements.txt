@@ -12,3 +12,4 @@ pandas
 bcrypt
 joblib
 scikit-learn
+openpyxl
